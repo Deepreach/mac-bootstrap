@@ -19,11 +19,15 @@
 # Piped form also works:
 #   curl -fsSL <url> | bash
 #
-# Overrides: MARKETPLACE_REPO, DEEPREACH_HOME, LOVI_BRANCH
+# Overrides: MARKETPLACE_REPO, MARKETPLACE_BRANCH, DEEPREACH_HOME, LOVI_BRANCH
+#   MARKETPLACE_BRANCH lets you test a branch of the marketplace before it is
+#   merged, e.g. MARKETPLACE_BRANCH=my-branch bash /tmp/dr-bootstrap.sh
 
 set -euo pipefail
 
 MARKETPLACE_REPO="${MARKETPLACE_REPO:-Deepreach/agents-marketplace}"
+MARKETPLACE_BRANCH="${MARKETPLACE_BRANCH:-}"
+export MARKETPLACE_BRANCH
 DEEPREACH_HOME="${DEEPREACH_HOME:-$HOME/deepreach}"
 MARKETPLACE_DIR="$DEEPREACH_HOME/agents-marketplace"
 SETUP_SCRIPT="$MARKETPLACE_DIR/plugins/lovi-designer/scripts/setup-mac.sh"
@@ -36,6 +40,39 @@ if [ -t 1 ]; then BOLD=$'\033[1m'; BLUE=$'\033[34m'; RED=$'\033[31m'; RESET=$'\0
 else BOLD=""; BLUE=""; RED=""; RESET=""; fi
 step() { printf '\n%s▶ %s%s\n' "$BOLD$BLUE" "$*" "$RESET"; }
 die()  { printf '\n%s✗ %s%s\n' "$RED$BOLD" "$*" "$RESET" >&2; exit 1; }
+
+# Homebrew's installer (and Nix's, and Devbox's) runs sudo NON-interactively
+# (`sudo -n`) when NONINTERACTIVE is set: it never prompts, it just fails with
+# "Insufficient permissions" if no credential is cached. So ask for the
+# password here, once, and keep it cached for the long installs that follow.
+# The keepalive is tied to a marker file, not to a PID: bootstrap.sh execs into
+# setup-mac.sh, which execs into a login shell at the end, so "$$" outlives the
+# setup and a PID-based loop would keep sudo open for the whole session.
+SUDO_KEEPALIVE_FILE="${SUDO_KEEPALIVE_FILE:-}"
+ensure_sudo() {
+  if [ -n "$SUDO_KEEPALIVE_FILE" ] && [ -f "$SUDO_KEEPALIVE_FILE" ] && sudo -n true 2>/dev/null; then
+    return 0
+  fi
+  if ! sudo -n true 2>/dev/null; then
+    if ! id -Gn | tr ' ' '\n' | grep -qx admin; then
+      die "Your account ($USER) is not an administrator of this Mac, and this step needs admin rights.
+  On a DeepReach Mac managed by Primo, ask the tech team to run the Fleet provisioning —
+  it installs these tools without admin rights — then run: dr-setup"
+    fi
+    echo "  Your Mac password is needed (nothing is shown while you type)."
+    sudo -v || die "sudo did not accept the password — run this again."
+  fi
+  # sudo's cache lasts 5 minutes; the installs that follow take longer.
+  SUDO_KEEPALIVE_FILE="$(mktemp "${TMPDIR:-/tmp}/dr-sudo-keepalive.XXXXXX")"
+  export SUDO_KEEPALIVE_FILE
+  ( while [ -f "$SUDO_KEEPALIVE_FILE" ]; do sudo -n true 2>/dev/null; sleep 50; done ) &
+}
+stop_sudo_keepalive() {
+  [ -n "${SUDO_KEEPALIVE_FILE:-}" ] && rm -f "$SUDO_KEEPALIVE_FILE"
+  sudo -k 2>/dev/null || true
+}
+
+trap stop_sudo_keepalive EXIT
 
 [ "$(uname -s)" = "Darwin" ] || die "This bootstrap is for macOS only."
 [ "$(id -u)" != "0" ] || die "Do not run this with sudo — run it as yourself."
@@ -57,7 +94,8 @@ fi
 if command -v brew >/dev/null 2>&1; then
   echo "  already installed"
 else
-  echo "  Installing (asks for your Mac password)..."
+  ensure_sudo
+  echo "  Installing..."
   NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
   eval "$(/opt/homebrew/bin/brew shellenv)"
 fi
@@ -77,14 +115,25 @@ gh auth setup-git >/dev/null 2>&1 || true
 step "DeepReach marketplace"
 mkdir -p "$DEEPREACH_HOME"
 if git -C "$MARKETPLACE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  git -C "$MARKETPLACE_DIR" fetch --quiet origin || true
+  if [ -n "$MARKETPLACE_BRANCH" ]; then
+    git -C "$MARKETPLACE_DIR" checkout --quiet "$MARKETPLACE_BRANCH" || die "No branch '$MARKETPLACE_BRANCH' in $MARKETPLACE_REPO."
+  fi
   git -C "$MARKETPLACE_DIR" pull --ff-only --quiet || true
-  echo "  already cloned, updated"
+  echo "  already cloned, updated ($(git -C "$MARKETPLACE_DIR" rev-parse --abbrev-ref HEAD))"
 else
-  gh repo clone "$MARKETPLACE_REPO" "$MARKETPLACE_DIR" \
-    || die "Cannot clone $MARKETPLACE_REPO. Ask an admin to add your GitHub account to the DeepReach organisation, then run this again."
+  if [ -n "$MARKETPLACE_BRANCH" ]; then
+    gh repo clone "$MARKETPLACE_REPO" "$MARKETPLACE_DIR" -- --branch "$MARKETPLACE_BRANCH" \
+      || die "Cannot clone branch '$MARKETPLACE_BRANCH' of $MARKETPLACE_REPO."
+  else
+    gh repo clone "$MARKETPLACE_REPO" "$MARKETPLACE_DIR" \
+      || die "Cannot clone $MARKETPLACE_REPO. Ask an admin to add your GitHub account to the DeepReach organisation, then run this again."
+  fi
 fi
 
-[ -f "$SETUP_SCRIPT" ] || die "Setup script not found at $SETUP_SCRIPT — the repository layout changed; ask the tech team."
+[ -f "$SETUP_SCRIPT" ] || die "Setup script not found at $SETUP_SCRIPT.
+  The branch checked out ($(git -C "$MARKETPLACE_DIR" rev-parse --abbrev-ref HEAD)) does not carry the lovi-designer plugin yet.
+  To test an unmerged branch: MARKETPLACE_BRANCH=<branch> bash $0"
 
 step "Handing over to the full setup"
 exec bash "$SETUP_SCRIPT" "$@"
