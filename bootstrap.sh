@@ -45,23 +45,34 @@ die()  { printf '\n%s✗ %s%s\n' "$RED$BOLD" "$*" "$RESET" >&2; exit 1; }
 # (`sudo -n`) when NONINTERACTIVE is set: it never prompts, it just fails with
 # "Insufficient permissions" if no credential is cached. So ask for the
 # password here, once, and keep it cached for the long installs that follow.
-SUDO_KEEPALIVE_PID=""
+# The keepalive is tied to a marker file, not to a PID: bootstrap.sh execs into
+# setup-mac.sh, which execs into a login shell at the end, so "$$" outlives the
+# setup and a PID-based loop would keep sudo open for the whole session.
+SUDO_KEEPALIVE_FILE="${SUDO_KEEPALIVE_FILE:-}"
 ensure_sudo() {
-  if sudo -n true 2>/dev/null; then return 0; fi
-  if ! id -Gn | tr ' ' '\n' | grep -qx admin; then
-    die "Your account ($USER) is not an administrator of this Mac, and this step needs admin rights.
+  if [ -n "$SUDO_KEEPALIVE_FILE" ] && [ -f "$SUDO_KEEPALIVE_FILE" ] && sudo -n true 2>/dev/null; then
+    return 0
+  fi
+  if ! sudo -n true 2>/dev/null; then
+    if ! id -Gn | tr ' ' '\n' | grep -qx admin; then
+      die "Your account ($USER) is not an administrator of this Mac, and this step needs admin rights.
   On a DeepReach Mac managed by Primo, ask the tech team to run the Fleet provisioning —
   it installs these tools without admin rights — then run: dr-setup"
+    fi
+    echo "  Your Mac password is needed (nothing is shown while you type)."
+    sudo -v || die "sudo did not accept the password — run this again."
   fi
-  echo "  Your Mac password is needed (nothing is shown while you type)."
-  sudo -v || die "sudo did not accept the password — run this again."
-  if [ -z "$SUDO_KEEPALIVE_PID" ]; then
-    # sudo's cache lasts 5 minutes; the installs below take longer. Refresh it
-    # until this process (or the setup script it execs into) is gone.
-    ( while kill -0 "$$" 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) &
-    SUDO_KEEPALIVE_PID=$!
-  fi
+  # sudo's cache lasts 5 minutes; the installs that follow take longer.
+  SUDO_KEEPALIVE_FILE="$(mktemp "${TMPDIR:-/tmp}/dr-sudo-keepalive.XXXXXX")"
+  export SUDO_KEEPALIVE_FILE
+  ( while [ -f "$SUDO_KEEPALIVE_FILE" ]; do sudo -n true 2>/dev/null; sleep 50; done ) &
 }
+stop_sudo_keepalive() {
+  [ -n "${SUDO_KEEPALIVE_FILE:-}" ] && rm -f "$SUDO_KEEPALIVE_FILE"
+  sudo -k 2>/dev/null || true
+}
+
+trap stop_sudo_keepalive EXIT
 
 [ "$(uname -s)" = "Darwin" ] || die "This bootstrap is for macOS only."
 [ "$(id -u)" != "0" ] || die "Do not run this with sudo — run it as yourself."
